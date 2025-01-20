@@ -3,7 +3,7 @@ return {
 		"neovim/nvim-lspconfig",
 		autostart = true,
 		config = function()
-			require("lspconfig").tsserver.setup{}
+			require("lspconfig").ts_ls.setup{}
 			require("lspconfig").rust_analyzer.setup{}
 			require("lspconfig").vimls.setup{}
 			require("lspconfig").bashls.setup{}
