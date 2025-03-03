@@ -1,6 +1,6 @@
 return {
-	{
-		"github/copilot.vim",
-		autostart = true,
-	},
+	-- {
+	-- 	"github/copilot.vim",
+	-- 	autostart = true,
+	-- },
 }

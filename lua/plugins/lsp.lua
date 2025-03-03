@@ -13,6 +13,7 @@ return {
 			require("lspconfig").cssls.setup{}
 			require("lspconfig").vuels.setup{}
 			require("lspconfig").jdtls.setup{}
+            require("lspconfig").pyright.setup{}
 		end,
 	},
 	{
