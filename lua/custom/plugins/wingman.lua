@@ -8,77 +8,63 @@ return {
     local curl = require("plenary.curl")
     local ns_id = api.nvim_create_namespace("wingman")
 
+    -- Configuration
     local config = {
-      ollama_url = "http://localhost:11434/api/generate",
-      model = "qwen2.5-coder:1.5b",
-      show_suggestions = true,
-      auto_trigger = true,
-      trigger_threshold = 3,
-      max_tokens = 100,
-      keymaps = {
-        accept = "<Tab>",
-        reject = "<C-]>",
-        next = "<C-n>",
-        prev = "<C-p>",
-      },
+      useOllama = false,                            -- Set to true for Ollama, false for Grok
+      ollama_url = "http://localhost:11434/api/generate", -- Ollama endpoint
+      grok_url = "https://api.x.ai/v1/chat/completions", -- Grok endpoint
+      api_key = ""
+      model = "grok-2-latest",                      -- Model (e.g., "llama3.2" for Ollama)
+      show_suggestions = true,                      -- Toggle suggestions on/off
+      auto_trigger = true,                          -- Enable automatic completion
+      trigger_threshold = 3,                        -- Min characters to trigger completion
+      temperature = 0.7,                            -- Controls creativity (lower for less repetition)
+      max_tokens = 300,                             -- Limits output length
+      keymaps = { accept = "<Tab>" },               -- Only <Tab> to accept suggestions
     }
 
+    -- State Management
     local state = {
-      suggestion_text = nil,
-      suggestion_line = nil,
-      suggestion_col = nil,
-      suggestion_virt_text_id = nil,
-      timer = nil,
-      prompt_in_progress = false,
-      latest_request_id = 0,
+      suggestion_text = nil,                        -- Current suggestion text
+      suggestion_virt_text_id = nil,                -- ID of virtual text
+      timer = nil,                                 -- Debounce timer
+      prompt_in_progress = false,                  -- Prevent concurrent requests
+      latest_request_id = 0,                       -- Track latest request
     }
 
+    -- Clear Current Suggestion
     local function clear_suggestion()
       if state.suggestion_virt_text_id then
         pcall(api.nvim_buf_del_extmark, 0, ns_id, state.suggestion_virt_text_id)
         state.suggestion_virt_text_id = nil
       end
       state.suggestion_text = nil
-      state.suggestion_line = nil
-      state.suggestion_col = nil
     end
 
+    -- Show Suggestion as Virtual Text
     local function show_suggestion(text, line, col, request_id)
-      if request_id ~= state.latest_request_id then
-        return
-      end
+      if request_id ~= state.latest_request_id then return end
       clear_suggestion()
-      if not text or text == "" then
-        return
-      end
+      if not text or text == "" then return end
 
       vim.schedule(function()
-        local current_cursor = api.nvim_win_get_cursor(0)
-        if current_cursor[1] ~= line then
-          return
-        end
+        local cursor = api.nvim_win_get_cursor(0)
+        if cursor[1] ~= line then return end
 
         local current_line = api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ""
         local clamped_col = math.min(col, #current_line)
-
         state.suggestion_text = text
-        state.suggestion_line = line
-        state.suggestion_col = clamped_col
 
-        local suggestion_lines = vim.split(text, "\n", { trimempty = true })
-        if #suggestion_lines == 0 then
-          return
-        end
+        local lines = vim.split(text, "\n", { trimempty = true })
+        if #lines == 0 then return end
 
-        local target_line = line - 1
-        local virt_text = { { suggestion_lines[1], "Comment" } }
+        local virt_text = { { lines[1], "Comment" } }
         local virt_lines = {}
-        for i = 2, #suggestion_lines do
-          table.insert(virt_lines, { { suggestion_lines[i], "Comment" } })
+        for i = 2, #lines do
+          table.insert(virt_lines, { { lines[i], "Comment" } })
         end
 
-        -- Fixed line: Use clamped_col instead of 0
-        state.suggestion_virt_text_id = api.nvim_buf_set_extmark(0, ns_id, target_line, clamped_col, {
+        state.suggestion_virt_text_id = api.nvim_buf_set_extmark(0, ns_id, line - 1, clamped_col, {
           virt_text = virt_text,
           virt_text_pos = "overlay",
           virt_lines = virt_lines,
@@ -87,97 +73,113 @@ return {
       end)
     end
 
+    -- Get Context Around Cursor
     local function get_context()
-      local bufnr = api.nvim_get_current_buf()
-      local cursor_pos = api.nvim_win_get_cursor(0)
-      local line = cursor_pos[1]
-      local col = cursor_pos[2]
-      local current_line = api.nvim_buf_get_lines(bufnr, line - 1, line, false)[1] or ""
+      local cursor = api.nvim_win_get_cursor(0)
+      local line = cursor[1]
+      local col = cursor[2]
+      local current_line = api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ""
       col = math.min(col, #current_line)
-      local prefix = string.sub(current_line, 1, col)
       local start_line = math.max(1, line - 10)
-      local prev_lines = api.nvim_buf_get_lines(bufnr, start_line - 1, line - 1, false)
+      local prev_lines = api.nvim_buf_get_lines(0, start_line - 1, line - 1, false)
       local context = table.concat(prev_lines, "\n")
-      if #context > 0 then
-        context = context .. "\n"
-      end
-      context = context .. prefix
-      return context, prefix, line, col
+      if #context > 0 then context = context .. "\n" end
+      context = context .. string.sub(current_line, 1, col)
+      return context, line, col
     end
 
+    -- Request Completion from API
     local function request_completion()
-      if state.prompt_in_progress then
-        return
-      end
+      if not config.show_suggestions or state.prompt_in_progress then return end
 
       state.latest_request_id = state.latest_request_id + 1
       local request_id = state.latest_request_id
 
-      local context, prefix, line, col = get_context()
-      if #context < config.trigger_threshold then
-        return
-      end
+      local context, line, col = get_context()
+      if #context < config.trigger_threshold then return end
 
       local filetype = vim.bo.filetype
-      local cursor_marker = "<|cursor|>"
-      local full_context = context .. cursor_marker
-      local prompt = "You are completing code in a " .. filetype .. " file.\n" ..
-                    "Context:\n```" .. filetype .. "\n" .. full_context .. "```\n" ..
-                    "Provide only the completion starting from the <|cursor|> marker. Do not repeat the existing code. only generate what is needed, and only the code."
+      local system_prompt = "You are a coding assistant. Your task is to provide code completions that continue the given snippet without repeating the existing code."
+      local user_prompt = "Continue this " .. filetype .. " snippet starting from where it ends. Do not repeat any of the existing code. Only provide the new code that follows:\n```\n" .. context .. "\n```"
 
       state.prompt_in_progress = true
-
-      curl.post({
-        url = config.ollama_url,
+      local url = config.useOllama and config.ollama_url or config.grok_url
+      local body
+      if config.useOllama then
         body = vim.json.encode({
           model = config.model,
-          prompt = prompt,
+          prompt = system_prompt .. "\n" .. user_prompt,
+          temperature = config.temperature,
+          num_predict = config.max_tokens,  -- Ollama's equivalent of max_tokens
           stream = false,
+        })
+      else
+        body = vim.json.encode({
+          model = config.model,
+          messages = {
+            { role = "system", content = system_prompt },
+            { role = "user", content = user_prompt },
+          },
+          temperature = config.temperature,
           max_tokens = config.max_tokens,
-        }),
-        headers = { content_type = "application/json" },
+          stream = false,
+        })
+      end
+
+      local headers = { ["Content-Type"] = "application/json" }
+      if not config.useOllama then
+        headers["Authorization"] = "Bearer " .. config.api_key
+      end
+
+      curl.post({
+        url = url,
+        body = body,
+        headers = headers,
         callback = function(response)
           state.prompt_in_progress = false
           if response.status ~= 200 then
-            vim.notify("Wingman: Error getting completion", vim.log.levels.ERROR)
+            vim.schedule(function()
+              vim.notify("Wingman: Error - Status: " .. response.status, vim.log.levels.ERROR)
+            end)
             return
           end
 
-          local result = vim.json.decode(response.body)
-          if not result or not result.response then
-            vim.notify("Wingman: Error decoding response", vim.log.levels.ERROR)
+          local success, result = pcall(vim.json.decode, response.body)
+          if not success then
+            vim.schedule(function()
+              vim.notify("Wingman: JSON error: " .. tostring(result), vim.log.levels.ERROR)
+            end)
             return
           end
 
-          local suggestion = result.response:gsub("^```[%w]*\n", ""):gsub("\n```$", ""):gsub(cursor_marker, "")
-          show_suggestion(suggestion, line, col, request_id)
+          local suggestion = config.useOllama and result.response or (
+            result.choices and result.choices[1].message.content
+          )
+          if suggestion then
+            suggestion = suggestion:gsub("^```[%w]*\n", ""):gsub("\n```$", "")
+            show_suggestion(suggestion, line, col, request_id)
+          end
         end,
       })
     end
 
+    -- Accept Suggestion and Insert into Buffer
     local function accept_suggestion()
-      if not state.suggestion_text then
-        return
-      end
+      if not state.suggestion_text then return end
 
-      local cursor_pos = api.nvim_win_get_cursor(0)
-      local line = cursor_pos[1]
-      local col = cursor_pos[2]
-
+      local cursor = api.nvim_win_get_cursor(0)
+      local line = cursor[1]
+      local col = cursor[2]
       local lines = vim.split(state.suggestion_text, "\n", { plain = true })
       api.nvim_buf_set_text(0, line - 1, col, line - 1, col, lines)
 
-      if #lines == 1 then
-        api.nvim_win_set_cursor(0, { line, col + #lines[1] })
-      else
-        local last_line = line + #lines - 1
-        local last_col = #lines[#lines]
-        api.nvim_win_set_cursor(0, { last_line, last_col })
-      end
-
+      local new_pos = #lines == 1 and { line, col + #lines[1] } or
+                      { line + #lines - 1, #lines[#lines] }
+      api.nvim_win_set_cursor(0, new_pos)
       clear_suggestion()
     end
 
+    -- Setup Autocommands and Keymaps
     local function setup()
       local group = api.nvim_create_augroup("Wingman", { clear = true })
 
@@ -187,62 +189,38 @@ return {
           callback = function()
             clear_suggestion()
             if state.timer then
-              vim.loop.timer_stop(state.timer)
+              state.timer:stop()
               state.timer:close()
-              state.timer = nil
             end
             state.timer = vim.loop.new_timer()
-            state.timer:start(1000, 0, vim.schedule_wrap(function()
-              if vim.fn.mode() == "i" then
-                request_completion()
-              end
+            state.timer:start(2000, 0, vim.schedule_wrap(function()
+              if vim.fn.mode() == "i" then request_completion() end
             end))
           end,
         })
-        api.nvim_create_autocmd("CursorMovedI", {
-          group = group,
-          callback = clear_suggestion,
-        })
-        api.nvim_create_autocmd("InsertLeave", {
+        api.nvim_create_autocmd({ "CursorMovedI", "InsertLeave" }, {
           group = group,
           callback = clear_suggestion,
         })
       end
 
-      vim.keymap.set("i", "<Tab>", function()
+      vim.keymap.set("i", config.keymaps.accept, function()
         if state.suggestion_text then
           vim.schedule(accept_suggestion)
           return ""
-        else
-          return "<Tab>"
         end
-      end, { expr = true })
-
-      vim.keymap.set("i", "<CR>", function()
-        local cr = api.nvim_replace_termcodes("<CR>", true, false, true)
-        api.nvim_feedkeys(cr, "n", false)
-        vim.schedule(request_completion)
-        return ""
-      end, { noremap = true, silent = true })
-
-      local keymaps = config.keymaps
-      vim.keymap.set("i", keymaps.reject, function()
-        if state.suggestion_text then
-          clear_suggestion()
-          return ""
-        else
-          return keymaps.reject
-        end
+        return config.keymaps.accept
       end, { expr = true })
     end
 
     setup()
 
-    vim.api.nvim_create_user_command("WingmanToggle", function()
+    -- User Commands
+    api.nvim_create_user_command("WingmanToggle", function()
       config.show_suggestions = not config.show_suggestions
       print("Wingman suggestions " .. (config.show_suggestions and "enabled" or "disabled"))
     end, {})
 
-    vim.api.nvim_create_user_command("WingmanComplete", request_completion, {})
+    api.nvim_create_user_command("WingmanComplete", request_completion, {})
   end,
 }
